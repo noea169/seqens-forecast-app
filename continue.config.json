@@ -1,0 +1,9 @@
+{
+    "provider": "anthropic",
+    "anthropic": {
+    "apiKey": "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"
+    },
+    "models": {
+    "default": "claude-3-opus-20240229"
+    }
+    }
