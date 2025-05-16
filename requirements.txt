@@ -1,0 +1,17 @@
+streamlit>=1.22.0
+pandas>=1.5.0
+numpy>=1.22.0
+plotly>=5.10.0
+prophet>=1.1.0
+statsmodels>=0.13.0
+scikit-learn>=1.0.0
+xgboost>=1.6.0
+streamlit-authenticator>=0.2.0
+streamlit-extras>=0.2.0
+streamlit-autorefresh>=0.0.1
+streamlit-option-menu>=0.3.0
+streamlit-tags>=1.0.0
+streamlit-aggrid>=0.3.0
+python-dotenv>=0.20.0
+jsonschema>=4.0.0
+openpyxl>=3.0.0
