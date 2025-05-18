@@ -15,3 +15,5 @@ streamlit-aggrid>=0.3.0
 python-dotenv>=0.20.0
 jsonschema>=4.0.0
 openpyxl>=3.0.0
+google-auth-oauthlib
+google-api-python-client
