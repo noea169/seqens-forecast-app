@@ -384,6 +384,100 @@ def generate_excel_report(df: pd.DataFrame) -> bytes:
     with io.BytesIO() as buffer:
         wb.save(buffer)
         return buffer.getvalue()
+def render_client_management_tab():
+    """
+    Affiche l'onglet de gestion des clients pour les vendeurs et les administrateurs
+    """
+    st.markdown("## 👥 Gestion des clients")
+    
+    user_id = st.session_state.user["id"]
+    user_role = st.session_state.user["role"]
+    
+    # Récupérer les clients assignés au vendeur connecté
+    conn = sqlite3.connect(DB_PATH)
+    
+    # Récupérer tous les clients disponibles
+    all_clients_df = pd.read_sql("""
+        SELECT DISTINCT ship_to_key, ship_to_name, ship_to_code, country
+        FROM forecasts
+        WHERE ship_to_key IS NOT NULL
+        ORDER BY ship_to_key
+    """, conn)
+    
+    # Récupérer les clients déjà assignés
+    assigned_clients_df = pd.read_sql("""
+        SELECT ca.ship_to_key, ca.ship_to_name, ca.ship_to_code, ca.ship_to_country, u.full_name as assigned_to
+        FROM client_assignments ca
+        JOIN users u ON ca.sales_rep_id = u.id
+        WHERE ca.sales_rep_id = ?
+    """, conn, params=[user_id])
+    
+    conn.close()
+    
+    # Afficher les clients assignés
+    st.subheader("Mes clients assignés")
+    if not assigned_clients_df.empty:
+        st.dataframe(assigned_clients_df)
+    else:
+        st.info("Aucun client ne vous est assigné pour le moment.")
+    
+    # Formulaire pour ajouter un client
+    with st.expander("➕ Ajouter un client", expanded=False):
+        with st.form("add_client_form"):
+            # Filtrer les clients qui ne sont pas déjà assignés
+            assigned_keys = assigned_clients_df['ship_to_key'].tolist() if not assigned_clients_df.empty else []
+            available_clients = all_clients_df[~all_clients_df['ship_to_key'].isin(assigned_keys)]
+            
+            if available_clients.empty:
+                st.warning("Tous les clients disponibles vous sont déjà assignés.")
+                submit_disabled = True
+            else:
+                submit_disabled = False
+                
+                # Créer un dictionnaire pour l'affichage
+                client_display = {}
+                for _, row in available_clients.iterrows():
+                    key = row['ship_to_key']
+                    name = row['ship_to_name'] if pd.notna(row['ship_to_name']) else "Sans nom"
+                    client_display[key] = f"{key} - {name}"
+                
+                # Sélection du client à ajouter
+                selected_client = st.selectbox(
+                    "Sélectionner un client à ajouter",
+                    options=available_clients['ship_to_key'].tolist(),
+                    format_func=lambda x: client_display.get(x, x)
+                )
+                
+                # Récupérer les informations du client sélectionné
+                client_info = available_clients[available_clients['ship_to_key'] == selected_client].iloc[0]
+            
+            submit = st.form_submit_button("Ajouter ce client", disabled=submit_disabled)
+            
+            if submit and not submit_disabled:
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.cursor()
+                    
+                    # Insérer le client dans la table des assignations
+                    cursor.execute("""
+                        INSERT INTO client_assignments 
+                        (sales_rep_id, ship_to_key, ship_to_code, ship_to_name, ship_to_country)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (
+                        user_id,
+                        client_info['ship_to_key'],
+                        client_info['ship_to_code'] if pd.notna(client_info['ship_to_code']) else "",
+                        client_info['ship_to_name'] if pd.notna(client_info['ship_to_name']) else "",
+                        client_info['country'] if pd.notna(client_info['country']) else ""
+                    ))
+                    
+                    conn.commit()
+                    conn.close()
+                    
+                    st.success(f"✅ Client {client_info['ship_to_key']} ajouté avec succès!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Erreur lors de l'ajout du client : {e}")
     
 
 def reset_database():
@@ -1325,6 +1419,9 @@ def init_database():
         )
     """)
 
+ # Assurer que des clients sont assignés pour les tests
+    ensure_client_assignments()
+
     # ✅ Admin par défaut si aucun utilisateur admin
     cur.execute("SELECT COUNT(*) FROM users WHERE role='admin'")
     if cur.fetchone()[0] == 0:
@@ -1339,6 +1436,48 @@ def init_database():
     conn.close()
 
 
+
+def ensure_client_assignments():
+    """Vérifie si des clients sont assignés et en ajoute si nécessaire"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Vérifier si des assignations existent
+    cursor.execute("SELECT COUNT(*) FROM client_assignments")
+    count = cursor.fetchone()[0]
+    
+    # Si aucune assignation n'existe, en créer quelques-unes pour test
+    if count == 0:
+        # Récupérer quelques clients de la table forecasts
+        cursor.execute("SELECT DISTINCT ship_to_key FROM forecasts LIMIT 10")
+        clients = cursor.fetchall()
+        
+        # Récupérer les utilisateurs avec rôle 'user'
+        cursor.execute("SELECT id FROM users WHERE role = 'user'")
+        users = cursor.fetchall()
+        
+        # Si aucun utilisateur 'user', utiliser l'admin
+        if not users:
+            cursor.execute("SELECT id FROM users WHERE role = 'admin'")
+            users = cursor.fetchall()
+        
+        if clients and users:
+            # Assigner les clients aux utilisateurs
+            for i, client in enumerate(clients):
+                user_id = users[i % len(users)][0]  # Répartir les clients entre les utilisateurs
+                try:
+                    cursor.execute("""
+                        INSERT INTO client_assignments 
+                        (sales_rep_id, ship_to_key, ship_to_code, ship_to_name) 
+                        VALUES (?, ?, ?, ?)
+                    """, (user_id, client[0], f"CODE_{client[0]}", f"Client {client[0]}"))
+                except sqlite3.IntegrityError:
+                    pass  # Ignorer les doublons
+            
+            conn.commit()
+            print(f"✅ {len(clients)} clients assignés automatiquement pour test")
+    
+    conn.close()
 
 
 
@@ -1973,22 +2112,86 @@ def render_collaborative_table():
     # Mais on garde une référence au premier mois pour l'affichage des détails
     selected_month = forecast_cols[0] if forecast_cols else None
 
-    # --- 4. FILTRES POUR LES DONNÉES ---
-    col1, col2, col3 = st.columns(3)
+                # --- 4. FILTRES POUR LES DONNÉES ---
+    col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1])
+    
+    # Récupérer les clients assignés au vendeur connecté
+    user_id = st.session_state.user["id"]
+    user_role = st.session_state.user["role"]
+    
+    # Par défaut, filtrer pour n'afficher que les clients du vendeur (sauf pour les admins)
+    show_all_clients = False
+    
+    # Récupérer les clients assignés au vendeur
+    assigned_clients = []
+    if user_role != "admin":
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            client_query = """
+                SELECT ship_to_key 
+                FROM client_assignments 
+                WHERE sales_rep_id = ?
+            """
+            assigned_df = pd.read_sql(client_query, conn, params=[user_id])
+            conn.close()
+            
+            if not assigned_df.empty:
+                assigned_clients = assigned_df['ship_to_key'].tolist()
+        except Exception as e:
+            st.warning(f"Impossible de récupérer les clients assignés: {e}")
+    
     with col1:
+        # Option pour basculer entre "Mes clients" et "Tous les clients"
+        if user_role != "admin" and assigned_clients:
+            show_all_clients = st.checkbox("👥 Afficher tous les clients", value=False)
+            
+            if not show_all_clients:
+                st.info(f"📋 Affichage de vos {len(assigned_clients)} clients assignés")
+    
+    with col2:
+        # Filtre par client spécifique
+        # Filtrer les valeurs None avant de trier
+        all_clients = [c for c in original_df['ship_to_key'].unique() if c is not None]
+        all_clients.sort()  # Trier après avoir filtré les None
+        
+        all_client_names = {}
+        
+        # Créer un dictionnaire pour afficher les noms des clients
+        for idx, row in original_df.iterrows():
+            if ('ship_to_key' in row and row['ship_to_key'] is not None and 
+                'ship_to_name' in row and row['ship_to_name'] is not None):
+                all_client_names[row['ship_to_key']] = str(row['ship_to_name'])
+        
+        # Fonction pour formater l'affichage des clients
+        def format_client(client_key):
+            if client_key is None:
+                return "Client inconnu"
+            name = all_client_names.get(client_key, '')
+            return f"{client_key} - {name}" if name else f"{client_key}"
+        
+        # Filtre de clients avec tous les clients disponibles
+        client_filter_specific = st.multiselect(
+            "🏢 Client spécifique",
+            options=all_clients,
+            default=[],
+            format_func=format_client
+        )
+    
+    with col3:
         product_filter = st.multiselect(
             "🧪 Filtrer par produit",
             options=sorted([p for p in original_df['product_line'].unique() if p is not None]),
             default=[]
         )
 
-    with col2:
+    with col4:
         country_filter = st.multiselect(
             "🌍 Filtrer par pays",
             options=sorted([c for c in original_df['country'].unique() if c is not None]),
             default=[]
         )
-    with col3:
+    
+    with col5:
         if 'client_type' in original_df.columns:
             client_options = [
                 c for c in original_df['client_type'].unique()
@@ -2002,15 +2205,24 @@ def render_collaborative_table():
         else:
             client_filter = []
 
+    # Appliquer les filtres
     filtered_df = original_df.copy()
+    
+    # Filtrer par clients assignés si nécessaire
+    if user_role != "admin" and assigned_clients and not show_all_clients:
+        filtered_df = filtered_df[filtered_df['ship_to_key'].isin(assigned_clients)]
+    
+    # Filtrer par client spécifique si sélectionné
+    if client_filter_specific:
+        filtered_df = filtered_df[filtered_df['ship_to_key'].isin(client_filter_specific)]
+    
+    # Appliquer les autres filtres
     if product_filter:
         filtered_df = filtered_df[filtered_df['product_line'].isin(product_filter)]
     if country_filter:
         filtered_df = filtered_df[filtered_df['country'].isin(country_filter)]
     if 'client_type' in original_df.columns and client_filter:
         filtered_df = filtered_df[filtered_df['client_type'].isin(client_filter)]
-
-    # ... suite de la construction de df_display et configuration d’AgGrid ...
 
 
                    # --- 5. COLONNES À AFFICHER ---
@@ -2113,13 +2325,21 @@ def render_collaborative_table():
     
     df_display["tooltip_info"] = df_display.apply(safe_tooltip_generator, axis=1)
     
-    # Tooltip avancé pour l'affichage au clic - avec gestion des erreurs
+       # Tooltip avancé pour l'affichage au clic - avec gestion des erreurs
     def safe_advanced_tooltip_generator(row):
         try:
+            # Récupérer l'ID de la ligne pour chercher les données complètes
+            row_id = row.get("id")
+            if row_id is not None:
+                # Récupérer la ligne complète depuis le DataFrame original
+                full_row = filtered_df[filtered_df["id"] == row_id].iloc[0] if not filtered_df[filtered_df["id"] == row_id].empty else row
+            else:
+                full_row = row
+                
             # Historique des 3 derniers mois - avec gestion des erreurs
             history = []
             try:
-                if 'ship_to_key' in row and 'material_description' in row:
+                if 'ship_to_key' in full_row and 'material_description' in full_row:
                     # Récupérer l'historique des modifications pour cette ligne
                     conn = sqlite3.connect(DB_PATH)
                     history_query = """
@@ -2131,7 +2351,7 @@ def render_collaborative_table():
                         LIMIT 3
                     """
                     
-                    history_df = pd.read_sql(history_query, conn, params=[row["ship_to_key"]])
+                    history_df = pd.read_sql(history_query, conn, params=[full_row["ship_to_key"]])
                     conn.close()
                     
                     if not history_df.empty:
@@ -2150,7 +2370,10 @@ def render_collaborative_table():
             # Commandes en cours (orderbook)
             orders = {}
             try:
-                orderbook_data = row.get("orderbook", {})
+                orderbook_data = full_row.get("orderbook", "{}")
+                # Convertir la chaîne JSON en dictionnaire si nécessaire
+                if isinstance(orderbook_data, str):
+                    orderbook_data = json.loads(orderbook_data)
                 if isinstance(orderbook_data, dict):
                     orders = {k: v for k, v in orderbook_data.items() if isinstance(v, (int, float)) and v > 0}
             except Exception:
@@ -2159,7 +2382,10 @@ def render_collaborative_table():
             # Budget mensuel (budget_dd)
             budget = {}
             try:
-                budget_data = row.get("budget_dd", {})
+                budget_data = full_row.get("budget_dd", "{}")
+                # Convertir la chaîne JSON en dictionnaire si nécessaire
+                if isinstance(budget_data, str):
+                    budget_data = json.loads(budget_data)
                 if isinstance(budget_data, dict):
                     budget = {k: v for k, v in budget_data.items() if isinstance(v, (int, float))}
             except Exception:
@@ -2168,7 +2394,10 @@ def render_collaborative_table():
             # Historique des variations de backlog
             backlog = {}
             try:
-                backlog_data = row.get("backlog_variation", {})
+                backlog_data = full_row.get("backlog_variation", "{}")
+                # Convertir la chaîne JSON en dictionnaire si nécessaire
+                if isinstance(backlog_data, str):
+                    backlog_data = json.loads(backlog_data)
                 if isinstance(backlog_data, dict):
                     backlog = {k: v for k, v in backlog_data.items() if isinstance(v, (int, float))}
             except Exception:
@@ -2187,6 +2416,8 @@ def render_collaborative_table():
                 "budget": {},
                 "backlog": {}
             }
+
+
 
 
     
@@ -2285,7 +2516,7 @@ function(params) {
     }
     """)
 
-        # Code JavaScript pour le tooltip avancé au clic
+            # Code JavaScript pour le tooltip avancé au clic
     cell_click_js = JsCode("""
     function(e) {
         try {
@@ -2309,12 +2540,12 @@ function(params) {
             }
             
             // Créer le contenu HTML du tooltip
-            let content = '<div style="background-color: white; border: 1px solid #ddd; padding: 15px; border-radius: 8px; box-shadow: 0 3px 10px rgba(0,0,0,0.2); max-width: 350px;">';
+            let content = '<div style="background-color: white; border: 1px solid #ddd; padding: 15px; border-radius: 8px; box-shadow: 0 3px 10px rgba(0,0,0,0.2); max-width: 350px; max-height: 400px; overflow-y: auto;">';
             
             // Titre
             const shipToKey = data.ship_to_key || 'ID inconnu';
             const materialDesc = data.material_description || 'Produit inconnu';
-            content += `<h4 style="margin-top: 0; color: #1f77b4; border-bottom: 1px solid #eee; padding-bottom: 8px;">${shipToKey} - ${materialDesc}</h4>`;
+            content += `<h4 style="margin-top: 0; color: #1f77b4; border-bottom: 1px solid #eee; padding-bottom: 8px; position: sticky; top: 0; background-color: white;">${shipToKey} - ${materialDesc}</h4>`;
             
             // Commandes en cours
             content += '<h5 style="margin-bottom: 5px; margin-top: 5px; color: #555;">📦 Commandes en cours</h5>';
@@ -2328,29 +2559,45 @@ function(params) {
                 content += '<p style="margin: 0; color: #777;">Aucune commande en cours</p>';
             }
             
-            // Budget
+                       // Budget
             content += '<h5 style="margin-bottom: 5px; margin-top: 15px; color: #555;">💰 Budget</h5>';
             if (tooltipData.budget && Object.keys(tooltipData.budget).length > 0) {
-                content += '<ul style="margin-top: 0; padding-left: 20px;">';
-                Object.entries(tooltipData.budget).forEach(([month, value]) => {
-                    content += `<li>${month}: <b>${value}</b></li>`;
-                });
-                content += '</ul>';
+                // Filtrer pour ne garder que les valeurs >= 1
+                const significantBudget = Object.entries(tooltipData.budget).filter(([_, value]) => value >= 1);
+                
+                if (significantBudget.length > 0) {
+                    content += '<ul style="margin-top: 0; padding-left: 20px;">';
+                    significantBudget.forEach(([month, value]) => {
+                        content += `<li>${month}: <b>${value}</b></li>`;
+                    });
+                    content += '</ul>';
+                } else {
+                    content += '<p style="margin: 0; color: #777;">Aucun budget significatif</p>';
+                }
             } else {
                 content += '<p style="margin: 0; color: #777;">Aucun budget disponible</p>';
             }
+
             
-            // Variations
+                        // Variations
             content += '<h5 style="margin-bottom: 5px; margin-top: 15px; color: #555;">📊 Variations</h5>';
             if (tooltipData.backlog && Object.keys(tooltipData.backlog).length > 0) {
-                content += '<ul style="margin-top: 0; padding-left: 20px;">';
-                Object.entries(tooltipData.backlog).forEach(([month, value]) => {
-                    content += `<li>${month}: <b>${value}</b></li>`;
-                });
-                content += '</ul>';
+                // Filtrer pour ne garder que les valeurs dont la valeur absolue est >= 1
+                const significantVariations = Object.entries(tooltipData.backlog).filter(([_, value]) => Math.abs(value) >= 1);
+                
+                if (significantVariations.length > 0) {
+                    content += '<ul style="margin-top: 0; padding-left: 20px;">';
+                    significantVariations.forEach(([month, value]) => {
+                        content += `<li>${month}: <b>${value}</b></li>`;
+                    });
+                    content += '</ul>';
+                } else {
+                    content += '<p style="margin: 0; color: #777;">Aucune variation significative</p>';
+                }
             } else {
                 content += '<p style="margin: 0; color: #777;">Aucune variation disponible</p>';
             }
+
             
             content += '</div>';
             
@@ -2383,6 +2630,7 @@ function(params) {
         }
     }
     """)
+
 
 
                     # --- 8. CONFIGURATION DES COLONNES ---
@@ -2895,7 +3143,12 @@ def render_app():
             "Consultation et gestion de vos clients"
         )
         render_fancy_header(header, subtitle, "👥")
-        render_clients_tab()
+        
+        # Utiliser render_clients_tab pour les admins et render_client_management_tab pour les utilisateurs
+        if roles == "admin":
+            render_clients_tab()
+        else:
+            render_client_management_tab()
 
     elif choice == "Administration" and roles == "admin":
         render_fancy_header(
@@ -2910,6 +3163,7 @@ def render_app():
         if st.button("← Retour"):
             # on remet par défaut sur Collaboration
             st.rerun()
+
 
 
 
@@ -2942,13 +3196,55 @@ def render_clients_tab():
             format_func=lambda x: sales_reps[sales_reps['id'] == x]['full_name'].iloc[0]
         )
 
-        # Formulaire d'ajout de client
+        # Récupérer tous les clients disponibles dans la base
+        all_clients_df = pd.read_sql("""
+            SELECT DISTINCT ship_to_key, ship_to_name, ship_to_code, country
+            FROM forecasts
+            WHERE ship_to_key IS NOT NULL
+            ORDER BY ship_to_key
+        """, conn)
+        
+        # Récupérer les clients déjà assignés à ce vendeur
+        assigned_clients_df = pd.read_sql("""
+            SELECT ship_to_key
+            FROM client_assignments
+            WHERE sales_rep_id = ?
+        """, conn, params=[selected_rep])
+        
+        # Filtrer pour ne montrer que les clients non assignés
+        assigned_keys = assigned_clients_df['ship_to_key'].tolist() if not assigned_clients_df.empty else []
+        available_clients = all_clients_df[~all_clients_df['ship_to_key'].isin(assigned_keys)]
+        
+        # Créer un dictionnaire pour l'affichage
+        client_display = {}
+        for _, row in available_clients.iterrows():
+            key = row['ship_to_key']
+            name = row['ship_to_name'] if pd.notna(row['ship_to_name']) else "Sans nom"
+            client_display[key] = f"{key} - {name}"
+
+        # Formulaire d'ajout de client avec sélection rapide
         with st.form("add_client_form"):
-            col1, col2 = st.columns(2)
+            col1, col2 = st.columns([1, 1])
+            
             with col1:
+                # Option 1: Sélection rapide d'un client existant
+                st.markdown("##### Option 1: Sélection rapide")
+                if not available_clients.empty:
+                    selected_client = st.selectbox(
+                        "Sélectionner un client existant",
+                        options=available_clients['ship_to_key'].tolist(),
+                        format_func=lambda x: client_display.get(x, x)
+                    )
+                    use_existing = st.checkbox("Utiliser ce client", value=True)
+                else:
+                    st.info("Tous les clients sont déjà assignés à ce vendeur.")
+                    use_existing = False
+            
+            with col2:
+                # Option 2: Saisie manuelle
+                st.markdown("##### Option 2: Saisie manuelle")
                 ship_to_key = st.text_input("🔑 Clé ship to")
                 ship_to_code = st.text_input("📝 Code client")
-            with col2:
                 ship_to_name = st.text_input("🏢 Nom du client")
                 ship_to_country = st.selectbox(
                     "🌍 Pays",
@@ -2960,11 +3256,29 @@ def render_clients_tab():
             if submitted:
                 try:
                     cur = conn.cursor()
-                    cur.execute("""
-                        INSERT INTO client_assignments 
-                        (sales_rep_id, ship_to_key, ship_to_code, ship_to_name, ship_to_country)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (selected_rep, ship_to_key, ship_to_code, ship_to_name, ship_to_country))
+                    
+                    if use_existing and not available_clients.empty:
+                        # Utiliser le client sélectionné
+                        client_info = available_clients[available_clients['ship_to_key'] == selected_client].iloc[0]
+                        cur.execute("""
+                            INSERT INTO client_assignments 
+                            (sales_rep_id, ship_to_key, ship_to_code, ship_to_name, ship_to_country)
+                            VALUES (?, ?, ?, ?, ?)
+                        """, (
+                            selected_rep,
+                            client_info['ship_to_key'],
+                            client_info['ship_to_code'] if pd.notna(client_info['ship_to_code']) else "",
+                            client_info['ship_to_name'] if pd.notna(client_info['ship_to_name']) else "",
+                            client_info['country'] if pd.notna(client_info['country']) else ""
+                        ))
+                    else:
+                        # Utiliser les données saisies manuellement
+                        cur.execute("""
+                            INSERT INTO client_assignments 
+                            (sales_rep_id, ship_to_key, ship_to_code, ship_to_name, ship_to_country)
+                            VALUES (?, ?, ?, ?, ?)
+                        """, (selected_rep, ship_to_key, ship_to_code, ship_to_name, ship_to_country))
+                    
                     conn.commit()
                     st.success("✅ Client ajouté avec succès!")
                     st.rerun()
@@ -3031,7 +3345,6 @@ def render_clients_tab():
 
     if 'conn' in locals():
         conn.close()
-
 
 def render_admin_section():
     """
