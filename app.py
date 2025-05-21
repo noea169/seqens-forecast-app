@@ -24,6 +24,8 @@ from typing import Optional, Dict
 import streamlit.components.v1 as components 
 import time
 import re 
+import subprocess
+import sys
 
 # Imports pour AgGrid
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode, JsCode
@@ -3245,12 +3247,12 @@ def render_collaborative_table():
     else:
         st.success(f"✅ {len(forecast_cols)} colonne(s) mensuelle(s) détectée(s).")
 
-        # --- 3. ÉDITION MULTI-COLONNES ---
+                # --- 3. ÉDITION MULTI-COLONNES ---
     # Toutes les colonnes listées dans `forecast_cols` seront rendues éditables dans la grille AgGrid (pas de sélection unique)
     # Mais on garde une référence au premier mois pour l'affichage des détails
     selected_month = forecast_cols[0] if forecast_cols else None
 
-                # --- 4. FILTRES POUR LES DONNÉES ---
+    # --- 4. FILTRES POUR LES DONNÉES ---
     col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1])
     
     # Récupérer les clients assignés au vendeur connecté
@@ -3288,17 +3290,37 @@ def render_collaborative_table():
     
     with col2:
         # Filtre par client spécifique
-        # Filtrer les valeurs None avant de trier
-        all_clients = [c for c in original_df['ship_to_key'].unique() if c is not None]
-        all_clients.sort()  # Trier après avoir filtré les None
-        
-        all_client_names = {}
-        
-        # Créer un dictionnaire pour afficher les noms des clients
-        for idx, row in original_df.iterrows():
-            if ('ship_to_key' in row and row['ship_to_key'] is not None and 
-                'ship_to_name' in row and row['ship_to_name'] is not None):
-                all_client_names[row['ship_to_key']] = str(row['ship_to_name'])
+        # IMPORTANT: Récupérer TOUS les clients depuis la base de données, pas seulement ceux assignés
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            all_clients_query = """
+                SELECT DISTINCT ship_to_key, ship_to_name 
+                FROM forecasts
+                WHERE ship_to_key IS NOT NULL
+                ORDER BY ship_to_key
+            """
+            all_clients_df = pd.read_sql(all_clients_query, conn)
+            conn.close()
+            
+            all_clients = all_clients_df['ship_to_key'].tolist()
+            
+            # Créer un dictionnaire pour afficher les noms des clients
+            all_client_names = {}
+            for _, row in all_clients_df.iterrows():
+                if row['ship_to_name'] is not None:
+                    all_client_names[row['ship_to_key']] = str(row['ship_to_name'])
+                    
+        except Exception as e:
+            # En cas d'erreur, utiliser les clients du DataFrame filtré
+            st.warning(f"Impossible de récupérer tous les clients: {e}")
+            all_clients = [c for c in original_df['ship_to_key'].unique() if c is not None]
+            all_clients.sort()
+            
+            all_client_names = {}
+            for idx, row in original_df.iterrows():
+                if ('ship_to_key' in row and row['ship_to_key'] is not None and 
+                    'ship_to_name' in row and row['ship_to_name'] is not None):
+                    all_client_names[row['ship_to_key']] = str(row['ship_to_name'])
         
         # Fonction pour formater l'affichage des clients
         def format_client(client_key):
@@ -3343,16 +3365,45 @@ def render_collaborative_table():
         else:
             client_filter = []
 
-    # Appliquer les filtres
+
+     
+        # Au début de la fonction, avant de filtrer original_df
+    # Sauvegarder une copie complète des données pour pouvoir accéder à tous les clients
+    if 'full_data' not in st.session_state:
+        # Charger toutes les données depuis la base de données
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            full_data_query = """
+                SELECT * FROM forecasts
+            """
+            st.session_state.full_data = pd.read_sql(full_data_query, conn)
+            conn.close()
+        except Exception as e:
+            st.warning(f"Impossible de charger toutes les données: {e}")
+            st.session_state.full_data = pd.DataFrame()  # DataFrame vide en cas d'erreur
+        
+
+        # Appliquer les filtres
     filtered_df = original_df.copy()
     
-    # Filtrer par clients assignés si nécessaire
-    if user_role != "admin" and assigned_clients and not show_all_clients:
+    # Filtrer par clients assignés si nécessaire, SAUF si des clients spécifiques sont sélectionnés
+    if user_role != "admin" and assigned_clients and not show_all_clients and not client_filter_specific:
         filtered_df = filtered_df[filtered_df['ship_to_key'].isin(assigned_clients)]
     
     # Filtrer par client spécifique si sélectionné
     if client_filter_specific:
-        filtered_df = filtered_df[filtered_df['ship_to_key'].isin(client_filter_specific)]
+        # Si l'utilisateur a sélectionné des clients spécifiques et n'est pas admin
+        if user_role != "admin" and 'full_data' in st.session_state and not st.session_state.full_data.empty:
+            # Récupérer les données complètes pour les clients sélectionnés
+            selected_clients_data = st.session_state.full_data[
+                st.session_state.full_data['ship_to_key'].isin(client_filter_specific)
+            ]
+            
+            # Utiliser ces données à la place de filtered_df
+            filtered_df = selected_clients_data.copy()
+        else:
+            # Pour les admins ou si les données complètes ne sont pas disponibles
+            filtered_df = filtered_df[filtered_df['ship_to_key'].isin(client_filter_specific)]
     
     # Appliquer les autres filtres
     if product_filter:
@@ -3361,6 +3412,8 @@ def render_collaborative_table():
         filtered_df = filtered_df[filtered_df['country'].isin(country_filter)]
     if 'client_type' in original_df.columns and client_filter:
         filtered_df = filtered_df[filtered_df['client_type'].isin(client_filter)]
+
+
 
 
                    # --- 5. COLONNES À AFFICHER ---
@@ -3388,29 +3441,29 @@ def render_collaborative_table():
             format_func=lambda x: x.replace("ACTUAL & FCST ", "") if x != "Aucun" else x
         )
     with col4:
-    # Sélection des colonnes d'emballage à afficher
+        # Sélection des colonnes d'emballage à afficher
         packaging_columns = ["moq_kg", "pallet_kg", "box_kg", "boxes_per_pallet"]
         packaging_labels = {
-        "moq_kg": "📦 MOQ (kg)",
-        "pallet_kg": "🔢 Palette (kg)",
-        "box_kg": "📦 Boîte (kg)",
-        "boxes_per_pallet": "🧮 Boîtes/Palette"
-    }
+            "moq_kg": "📦 MOQ (kg)",
+            "pallet_kg": "🔢 Palette (kg)",
+            "box_kg": "📦 Boîte (kg)",
+            "boxes_per_pallet": "🧮 Boîtes/Palette"
+        }
         
+        packaging_cols_to_show = st.multiselect(
+            "📦 Colonnes d'emballage",
+            options=packaging_columns,
+            default=[],
+            format_func=lambda x: packaging_labels.get(x, x)
+        )
+
     # 1) Colonnes toujours visibles
     default_display_cols = [
         "ship_to_key",
         "ship_to_name",
-        "material_description"
-]
+        "material_description",
+    ]
      
-    packaging_cols_to_show = st.multiselect(
-        "📦 Colonnes d'emballage",
-        options=packaging_columns,
-        default=[],
-        format_func=lambda x: packaging_labels.get(x, x)
-    )
-
     # 2) Les mois de forecast
     # Utiliser forecast_cols_sorted déjà défini ci-dessus
     if show_all_months:
@@ -3421,7 +3474,7 @@ def render_collaborative_table():
         first_6_months = forecast_cols_sorted[:6]
         months_to_display = first_6_months
     
-           # Ajouter les mois au display
+    # Ajouter les mois au display
     default_display_cols += months_to_display
     
     # Ajouter le mois supplémentaire s'il est sélectionné
@@ -3460,8 +3513,22 @@ def render_collaborative_table():
     if "id" not in display_cols:
         display_cols.append("id")
 
-    # 6) Nouveau DataFrame
+        # 6) Nouveau DataFrame
     df_display = filtered_df[display_cols].copy()
+
+    # Ajouter une colonne pour la différence entre budget et forecast
+    if "full_year_budget" in df_display.columns and "full_year_forecast" in df_display.columns:
+        # Calculer la différence directement dans df_display
+        df_display["budget_forecast_diff"] = df_display["full_year_forecast"] - df_display["full_year_budget"]
+        
+        # Ajouter la colonne aux listes de colonnes pour référence future
+        if "budget_forecast_diff" not in default_display_cols:
+            default_display_cols.append("budget_forecast_diff")
+        
+        if "budget_forecast_diff" not in display_cols:
+            display_cols.append("budget_forecast_diff")
+        
+        # Ne pas recréer le DataFrame - la colonne est déjà ajoutée à df_display
 
 
 
@@ -3877,7 +3944,7 @@ function(e) {
         "moq_kg", "pallet_kg", "box_kg", "boxes_per_pallet"
     ]
     
-        # Configuration des colonnes
+    # Configuration des colonnes
     for col in df_display.columns:
         if col in ["id", "advanced_tooltip", "tooltip_info"]:
             # Colonnes cachées
@@ -3902,6 +3969,7 @@ function(e) {
                 tooltipField="tooltip_info",
                 cellEditor="agNumericCellEditor",
                 cellEditorParams={},
+                minWidth=120,                    # Largeur minimale pour les colonnes mensuelles
                 valueParser=JsCode("""
                     function(params) {
                         return parseFloat(params.newValue);
@@ -3911,15 +3979,19 @@ function(e) {
             )
 
         elif col in id_columns:
-            # Colonnes d'identification (non éditables)
-            gb.configure_column(
-                col,
-                editable=False,
-                filterable=True,
-                sortable=True,
-                resizable=True,
-                pinned="left"
-            )
+    # Colonnes d'identification (non éditables)
+         gb.configure_column(
+        col,
+        editable=False,
+        filterable=True,
+        sortable=True,
+        resizable=True,
+        minWidth=120,                    # Largeur minimale
+        maxWidth=200,                    # Largeur maximale pour éviter l'étirement
+        flex=0,                          # Désactiver flex pour éviter l'étirement
+        pinned="left"
+    )
+
             
         elif col in packaging_columns:
             # Nouvelles colonnes d'emballage (non éditables)
@@ -3938,6 +4010,7 @@ function(e) {
                 filterable=True,
                 sortable=True,
                 resizable=True,
+                minWidth=120,                    # Largeur minimale pour les colonnes d'emballage
                 type="numericColumn",
                 valueFormatter=JsCode("""
                     function(params) {
@@ -3965,13 +4038,10 @@ function(e) {
                 resizable=True
             )
 
-
-
-    
-        # Configuration de la sélection et des options de la grille
+    # Configuration de la sélection et des options de la grille
     gb.configure_selection("single")
     
-        # Configuration de la sélection et des options de la grille
+    # Configuration de la sélection et des options de la grille
     gb.configure_selection("single")
     
     # Options générales de la grille
@@ -3990,6 +4060,8 @@ function(e) {
         stopEditingWhenCellsLoseFocus=True,
         enterMovesDown=False,
         singleClickEdit=True,
+        suppressHorizontalScroll=False,   # Permettre le défilement horizontal
+        alwaysShowHorizontalScroll=True,  # Toujours afficher la barre de défilement horizontale
         defaultColDef={
             'flex': 1,
             'minWidth': 100,
@@ -4005,89 +4077,139 @@ function(e) {
         }
         """)
     )
+       # Configurer la colonne de différence budget-forecast avec coloration conditionnelle
+    if "budget_forecast_diff" in df_display.columns:
+        gb.configure_column(
+            "budget_forecast_diff",
+            header_name="Écart Budget-Forecast",
+            editable=False,
+            filterable=True,
+            sortable=True,
+            resizable=True,
+            minWidth=150,
+            type="numericColumn",
+            valueFormatter=JsCode("""
+                function(params) {
+                    if (params.value === null || params.value === undefined) return '';
+                    return params.value.toLocaleString();
+                }
+            """),
+            cellStyle=JsCode("""
+                function(params) {
+                    if (params.value === null || params.value === undefined) return null;
+                    if (params.value > 0) return { color: 'green', fontWeight: 'bold' };
+                    if (params.value < 0) return { color: 'red', fontWeight: 'bold' };
+                    return null;
+                }
+            """)
+        )
+
+     
     
+
     # Construction finale des options de grille
     grid_opts = gb.build()
 
+                       # --- 9. AFFICHAGE DE LA GRILLE -------------------------------------------
+    # Créer un ID unique pour le wrapper
+    grid_wrapper_id = "grid-wrapper-" + str(int(time.time()))
 
-    
-                               # --- 9. AFFICHAGE DE LA GRILLE -------------------------------------------
-    st.markdown('<div id="grid-wrapper" style="position:relative;">',
+    # Créer le conteneur pour le tableau
+    st.markdown(f'<div id="{grid_wrapper_id}" style="position:relative; width:100%;">',
                 unsafe_allow_html=True)
 
     from st_aggrid import GridUpdateMode, DataReturnMode
 
+    # Variable pour suivre l'état du mode plein écran
+    if 'fullscreen_mode' not in st.session_state:
+        st.session_state.fullscreen_mode = False
+
+    # Bouton plein écran simple avec Streamlit
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col2:
+        if st.button("📺 Afficher en plein écran" if not st.session_state.fullscreen_mode else "❌ Quitter le plein écran", 
+                    use_container_width=True):
+            st.session_state.fullscreen_mode = not st.session_state.fullscreen_mode
+            st.rerun()
+
+    # Ajuster la hauteur en fonction du mode
+    grid_height = 900 if st.session_state.fullscreen_mode else 700
+
     grid_response = AgGrid(
-    df_display,
-    
-    gridOptions=grid_opts,
-    update_mode=GridUpdateMode.VALUE_CHANGED,        # ✅ modèle mis à jour = meilleur déclencheur
-    data_return_mode=DataReturnMode.AS_INPUT
-,  # ✅ important pour garder toutes les données à jour
-    fit_columns_on_grid_load=True,
-    theme="streamlit",
-    height=700,
-    allow_unsafe_jscode=True,
-    custom_css=custom_css,
-    reload_data=False
-)
-    
+        df_display,
+        gridOptions=grid_opts,
+        update_mode=GridUpdateMode.VALUE_CHANGED,        # ✅ modèle mis à jour = meilleur déclencheur
+        data_return_mode=DataReturnMode.AS_INPUT,        # ✅ important pour garder toutes les données à jour
+        fit_columns_on_grid_load=False,                  # Ne pas ajuster automatiquement les colonnes
+        theme="streamlit",
+        height=grid_height,
+        width='100%',                                    # Utiliser 100% de la largeur disponible
+        allow_unsafe_jscode=True,
+        custom_css=custom_css,
+        reload_data=False
+    )
 
     updated_df = pd.DataFrame(grid_response["data"])
     updated_df["id"] = updated_df["id"].astype(int)  # ← AJOUT TRÈS IMPORTANT
-    selected   = grid_response["selected_rows"]
-
-
-    
-    
+    selected = grid_response["selected_rows"]
 
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-    # -------------------------------------------------------------------------
-    #  Bouton plein‑écran et script   →   même iframe, donc pas de sandbox clash
-    # -------------------------------------------------------------------------
-    components.html(
-        """
-        <style>
-          #fs-btn{
-            position:fixed;
-            bottom:20px; right:20px;
-            width:42px; height:42px;
-            border:none; border-radius:50%;
-            background:#1f77b4;  color:#fff;
-            font-size:1.3rem; font-weight:bold;
-            cursor:pointer;   z-index:1000;
-          }
-          /* Wrapper en plein‑écran quand on ajoute .fullscreen */
-          #grid-wrapper.fullscreen{
-            position:fixed !important;
-            inset:0 !important;   /* top:0; right:0; bottom:0; left:0 */
-            width:100vw !important; height:100vh !important;
-            background:#fff;   padding:12px;
-            z-index:9999;
-          }
-          #grid-wrapper.fullscreen .ag-root-wrapper{
-            height:100% !important;    /* force Ag‑Grid à remplir */
-          }
-        </style>
-
-        <!-- Le bouton -->
-        <button id="fs-btn" title="Plein écran">⛶</button>
-
-        <script>
-          const btn     = document.getElementById("fs-btn");
-          const wrapper = window.parent.document.getElementById("grid-wrapper");
-
-          btn.addEventListener("click", ()=> {
-              if(!wrapper){ console.error("grid-wrapper introuvable"); return; }
-              wrapper.classList.toggle("fullscreen");
-          });
-        </script>
+    # Bouton plein écran avec JavaScript intégré dans un iframe pour éviter les conflits
+    components.iframe(
+        f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{
+                    margin: 0;
+                    padding: 0;
+                    overflow: hidden;
+                }}
+                button {{
+                    width: 100%;
+                    padding: 10px;
+                    background-color: #1f77b4;
+                    color: white;
+                    font-weight: bold;
+                    border: none;
+                    border-radius: 5px;
+                    cursor: pointer;
+                }}
+            </style>
+        </head>
+        <body>
+            <button id="fullscreen-btn">📺 Afficher en plein écran</button>
+            <script>
+                document.getElementById('fullscreen-btn').addEventListener('click', function() {{
+                    const wrapper = window.parent.document.getElementById('{grid_wrapper_id}');
+                    if (wrapper) {{
+                        // Ajouter la classe fullscreen
+                        wrapper.classList.add('fullscreen');
+                        
+                        // Créer le bouton de sortie
+                        const exitBtn = window.parent.document.createElement('button');
+                        exitBtn.className = 'exit-button';
+                        exitBtn.innerText = '❌ Quitter le plein écran';
+                        exitBtn.onclick = function() {{
+                            wrapper.classList.remove('fullscreen');
+                            this.remove();
+                        }};
+                        window.parent.document.body.appendChild(exitBtn);
+                    }}
+                }});
+            </script>
+        </body>
+        </html>
         """,
-        height=0,  # iframe invisible (mais le bouton est en position:fixed donc visible)
+        height=50,
         scrolling=False
     )
+
+
+
 
 
 
