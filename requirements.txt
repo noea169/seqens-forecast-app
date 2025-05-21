@@ -19,4 +19,6 @@ google-auth          # fournit google.oauth2
 gspread              # interface Python pour Google Sheets
 google-auth-oauthlib  # si tu utilises OAuth flows
 google-api-python-client  # client générique pour les API Google
+xlsxwriter
+
 
